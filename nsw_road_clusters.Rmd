@@ -1,0 +1,363 @@
+# setup
+```{r}
+library(librarian)
+shelf(percopackage, sf, igraph, tidyverse, readxl)
+getwd()
+```
+
+# data 
+```{r}
+au_net <- read_xlsx("./data/clean/au_edge_list.xlsx")
+au_net <- au_net %>% select(edge_id, node_id, Length, x, y)
+
+node_from <- au_net %>%
+    group_by(edge_id) %>%
+    filter(n() != 1) %>%
+    slice(1) %>%
+    select(edge_id, node_id, Length) %>%
+    rename(node_from = node_id) %>%
+    ungroup()
+
+node_to <- au_net %>%
+    group_by(edge_id) %>%
+    filter(n() != 1) %>%
+    slice(2) %>%
+    select(edge_id, node_id, Length) %>%
+    rename(node_to = node_id) %>%
+    ungroup()
+
+au_dm <- node_from %>%
+    left_join(node_to) %>%
+    select(node_from, node_to, Length) %>%
+    rename(distance = Length)
+
+names(au_dm)[names(au_dm) == "node_from"] <- "idNode1"
+names(au_dm)[names(au_dm) == "node_to"] <- "idNode2"
+names(au_dm)[names(au_dm) == "distance"] <- "weight"
+
+# make graph
+G_all <- graph.data.frame(au_dm, directed = F)
+summary(G_all)
+head(get.edgelist(G_all))
+```
+
+# get node coordinates
+```{r}
+au_coords <- read.csv("./data/clean/au_node_list.csv")
+au_coords <- au_coords %>% select(node_id, x, y)
+
+names(au_coords)[names(au_coords) == "node_id"] <- "name"
+names(au_coords)[names(au_coords) == "X"] <- "x"
+names(au_coords)[names(au_coords) == "Y"] <- "y"
+
+# min max coordinate
+xmin <- min(au_coords$x)
+xmax <- max(au_coords$x)
+ymin <- min(au_coords$y)
+ymax <- max(au_coords$y)
+
+# matching coords dataframe to graph
+coordsPoints <- au_coords[au_coords$name %in% as.numeric(V(G_all)$name),]
+matched <- match(as.numeric(V(G_all)$name), coordsPoints[, 1])
+
+V(G_all)$x <- as.numeric(coordsPoints[matched, 2])
+V(G_all)$y <- as.numeric(coordsPoints[matched, 3])
+
+# Plot streets of sydney
+plot(G_all, vertex.label = NA, vertex.size = 0.01)
+```
+
+# check components
+```{r}
+# component == 1, so all connected
+components(G_all)$no
+
+# Check for disconnected components: csize. This operation gives you the membership of each point, the cluster size of each component is obtained by typing $csize and the number of clusters $no.
+summary(components(G_all))
+
+# cluster size
+dist_sizes <- components(G_all)$csize
+dist_sizes[1:20]
+
+# 100% of the nodes belong to the largest component if
+# largest_comp/tot_nodes
+largest_cpt <- max(dist_sizes)
+tot_nodes <- length(V(G_all))
+largest_cpt/tot_nodes
+```
+
+```{r}
+# If mine is already one LCC then there'd be no need to run this Some disconnected components are the outcome of the way we selected the area of interest, while some others might be a problem in the construction of the road networks: segments of streets disconnected, etc. Let us take only the largest connected component
+gclust <- components(G_all, mode = "weak")
+
+largestConnectedComponent <- induced.subgraph(G_all, V(G_all)[which(gclust$membership == which.max(gclust$csize))])
+
+G <- largestConnectedComponent
+
+all_weights <- (E(G)$weight)
+
+summary(G)
+
+size_net <- length(V(G))
+
+# Plotting again
+plot(G, vertex.label = NA, vertex.size = 0.01)
+```
+
+# percolation
+```{r}
+dir_res <- "./data/percolation/results_coords/"
+dir.create(dir_res)
+
+# And the directory where you will create your membership tables
+dir_memb <- paste0(dir_res, "membTables/")
+dir.create(dir_memb)
+
+# Files for the results: number of clusters at each threshold
+file_n_clust <- paste0(dir_res, "n_clusters_p")
+
+# file for the largest cluster size
+file_clust_size <- paste0(dir_res, "clust_p_size.txt")
+```
+
+```{r}
+# RUN percolation, define vector with percolation threshold
+rmin <- 100
+rmax <- 30000
+r0 <- seq(rmin, rmax, by = 20)
+n_loops <- length(r0)
+write("threshold\t size", file = file_clust_size, append = FALSE)
+
+# Define thresholds to plot
+jumps_2plot <- c(100, 200, 300, 400, 500, 600, 800, 1000, 1500, 2500, 5000, 8000, 10000, 15000, 20000, 25000, 30000)
+```
+
+
+```{r}
+for (i_t in r0) {
+    # find subgraph such that all weights <= threshold r0
+    g <- subgraph.edges(G, E(G)[weight <= i_t], delete.vertices = TRUE)
+    membclusters <- clusters(g, mode = "weak")$membership
+    head(membclusters)
+    m <- cbind(V(g)$name, membclusters)
+    colnames(m) <- c("id_point", "id_cluster")
+    head(m)
+
+    # file for membership table for each threshold
+    file_name <- paste0(dir_memb, "amg_p")
+
+    file_memb <- paste0(file_name, i_t, ".txt")
+    write.table(m, file_memb, col.names = TRUE, sep = ",", row.names = FALSE)
+
+    M_data <- as.data.frame(m)
+    head(M_data)
+    table_data <- table(M_data$id_cluster)
+    head(table_data)
+
+    # Largest connected component
+    LCC <- max(unname(table_data))
+    LCC_p <- LCC/size_net
+    v_LCC <- c(i_t, LCC, LCC_p)
+    if (i_t == rmin) {
+        v_LCC_t <- v_LCC
+    } else {
+        v_LCC_t <- rbind(v_LCC_t, v_LCC)
+    }
+
+    sorted_table <- sort(table_data, decreasing = T)
+    head(sorted_table)
+    file_out <- paste(file_n_clust, i_t, ".txt", sep = "")
+    write.table(sorted_table, file_out, row.names = FALSE, col.names = c("id_cluster", "n_points"))
+
+    # let us construct at the same time the file with the largest
+    # cluster size, i.e. connected component.
+    write(c(i_t, LCC), file = file_clust_size, append = TRUE)
+
+    if (i_t %in% jumps_2plot) {
+        # plot the network take subcomponents
+        gg <- components(g, mode = "weak")
+        largestConnectedComponent <- induced.subgraph(g, V(g)[which(gg$membership ==  which.max(gg$csize))])
+        gg <- largestConnectedComponent
+        all_weights <- (E(gg)$weight)
+        plot(gg, vertex.label = NA, vertex.size = 0.01)
+        title(paste0("Percolation at d=", i_t))
+    }
+}
+```
+
+
+```{r}
+nr <- c()
+largestclustsize <- c()
+clustnum <- c()
+
+for (i_t in r0) {
+    # find subgraph such that all weights <= threshold r0
+    g <- subgraph.edges(G, E(G)[weight <= i_t], delete.vertices = TRUE)
+    membclusters <- clusters(g, mode = "weak")$membership
+    head(membclusters)
+    m <- cbind(V(g)$name, membclusters)
+    colnames(m) <- c("id_point", "id_cluster")
+    head(m)
+    # file for membership table for each threshold
+    file_name <- paste0(dir_memb, "amg_p")
+
+    file_memb <- paste0(file_name, i_t, ".txt")
+    write.table(m, file_memb, col.names = T, sep = ",", row.names = F)
+
+    M_data <- as.data.frame(m)
+    head(M_data)
+    table_data <- table(M_data$id_cluster)
+    head(table_data)
+    # Largest connected component
+    LCC <- max(unname(table_data))
+    LCC_p <- LCC/size_net
+    v_LCC <- c(i_t, LCC, LCC_p)
+    if (i_t == rmin) {
+        v_LCC_t <- v_LCC
+    } else {
+        v_LCC_t <- rbind(v_LCC_t, v_LCC)
+    }
+
+    sorted_table <- sort(table_data, decreasing = T)
+
+    # 2nd Largest connected component
+    SLCC <- sorted_table[2]
+    SLCC_p <- SLCC/size_net
+    v_SLCC <- c(i_t, SLCC, SLCC_p)
+
+    if (i_t == rmin) {
+        v_SLCC_t <- v_SLCC
+    } else {
+        v_SLCC_t <- rbind(v_SLCC_t, v_SLCC)
+    }
+
+    # 3rd Largest connected component
+    TLCC <- sorted_table[3]
+    TLCC_p <- TLCC/size_net
+    v_TLCC <- c(i_t, TLCC, TLCC_p)
+    if (i_t == rmin) {
+        v_TLCC_t <- v_TLCC
+    } else {
+        v_TLCC_t <- rbind(v_TLCC_t, v_TLCC)
+    }
+
+    # nr<-append(nr,nrow(sorted_table))
+    nr <- append(nr, sorted_table)
+    largestclustsize <- append(largestclustsize, sorted_table[1])
+    clustnum <- append(clustnum, length(sorted_table))
+
+    file_out <- paste(file_n_clust, i_t, ".txt", sep = "")
+    write.table(sorted_table, file_out, row.names = FALSE, col.names = c("id_cluster",
+        "n_points"))
+
+    # let us construct at the same time the file with the largest
+    # cluster size, i.e. connected component.
+    write(c(i_t, LCC), file = file_clust_size, append = TRUE)
+
+    if (i_t %in% jumps_2plot) {
+        # plot the network take subcomponents
+        gg <- components(g, mode = "weak")
+        largestConnectedComponent <- induced.subgraph(g, V(g)[which(gg$membership ==  which.max(gg$csize))])
+        gg <- largestConnectedComponent
+        all_weights <- (E(gg)$weight)
+        plot(gg, vertex.label = NA, vertex.size = 0.01)
+        title(paste0("Percolation at d=", i_t))
+
+    }
+}
+```
+
+```{r}
+hist((nr), breaks = 10)
+
+plot(r0, clustnum)
+plot(v_LCC_t[, 1], v_LCC_t[, 3], xlab = "distance", ylab = "size", pch = 16, cex = 0.5, panel.first = grid())
+plot(v_SLCC_t[, 1], v_SLCC_t[, 3], xlab = "distance", ylab = "size", pch = 16, cex = 0.5, panel.first = grid())
+plot(v_TLCC_t[, 1], v_TLCC_t[, 3], xlab = "distance", ylab = "size", pch = 16, cex = 0.5, panel.first = grid())
+```
+
+```{r}
+# shelf(reshape2, igraph, plyr, rgdal)
+```
+
+# percolation maps
+```{r}
+# define the colours for the 10 top clusters
+library(RColorBrewer)
+col_scale_11 = brewer.pal(11, 'Spectral')
+col_scale_11[1] = "#A6A6A6"
+
+dir <- "./data/percolation/results_coords/"
+file_network <- paste0(dir,"amg_network.txt")
+
+# if the network is embedded in space we can get its coordinates as well to plot the network in space
+file_coords <- paste0(dir,"amg_coords.txt")
+
+#Now let us create the directory for the results
+dir_res <- "./data/percolation/results_coords/"
+dir_maps <- paste0(dir_res, "maps/")
+dir.create(dir_maps)
+```
+
+
+```{r}
+for (i_t in r0) {
+    # i_t=50
+    print(paste0("we are in loop=", i_t))
+    # find subgraph such that all weights <= threshold r0
+    g <- subgraph.edges(G, E(G)[weight <= i_t])
+    # plot(g,vertex.label=NA,vertex.size=.01)
+
+    # take subcomponents
+    membclusters <- clusters(g, mode = "weak")$membership
+    m <- cbind(V(g)$name, membclusters)
+    colnames(m) <- c("id_point", "id_cluster")
+
+    M_data <- as.data.frame(m)
+    head(M_data)
+    table_data <- table(M_data$id_cluster)
+    tail(table_data)
+
+    sorted_table <- sort(table_data, decreasing = T)
+    head(sorted_table)
+
+    #----------- assign colours
+    # Let us get the top 10 clusters
+
+    list_clusts <- as.data.frame(sorted_table)
+    # add RANDOM COLOURS AQUI
+    colnames(list_clusts) <- c("id_cluster", "n_points")
+    head(list_clusts)
+    list_clusts$colour <- col_scale_11[1]  #TODO: check if needed
+    list_clusts[1:10, "colour"] <- col_scale_11[2:11]
+    list_clusts$size <- 0.1
+    list_clusts$size[1:10] <- 0.2
+    head(m)
+
+    total_list <- merge(list_clusts, m, by = "id_cluster")
+    head(total_list)
+    colnames(au_coords) <- c("id_point", "x", "y")
+    points_coords_cols <- merge(total_list, au_coords, by = "id_point")
+    # convert this dataframe into a spatial dataframe with 'geometry'
+    data_sf <- st_as_sf(points_coords_cols, coords = c("x", "y"), crs = 4326)
+
+    # Export the spatial dataframe into a shapefile
+    st_write(data_sf, paste("./data/percolation/results_coords/shp_top10/shp_top10_",
+        i_t, ".shp", sep = ""))
+
+    head(points_coords_cols)
+    dir_maps <- "./data/percolation/results_coords/maps/"
+    file_map <- paste0(dir_maps, "amg_d", i_t, ".png")
+    png(file_map, height = 850, width = 1000)
+    par(bg = "black")
+
+    plot(points_coords_cols$x, points_coords_cols$y, xlab = NA, ylab = NA,
+        xlim = c(xmin, xmax), ylim = c(ymin, ymax), pch = 16, cex = as.numeric(points_coords_cols$size),
+        axes = F, frame.plot = F, col = points_coords_cols$colour)
+    title(main = paste0("amg at d=", i_t, "m"), col.main = "white")
+    dev.off()
+}
+```
+
+# percopackage
